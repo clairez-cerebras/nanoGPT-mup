@@ -13,6 +13,7 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
+from torch import Tensor
 from torch.nn import functional as F
 
 class LayerNorm(nn.Module):
@@ -25,6 +26,27 @@ class LayerNorm(nn.Module):
 
     def forward(self, input):
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
+
+
+class Rotary(nn.Module):
+    def __init__(self, dim: int, max_seq_len: int):
+        super().__init__()
+        # half-truncate RoPE by @YouJiacheng (w/ base freq tuning)
+        angular_freq = (1 / 1024) ** torch.linspace(0, 1, steps=dim//4, dtype=torch.float32)
+        angular_freq = torch.cat([angular_freq, angular_freq.new_zeros(dim//4)])
+        t = torch.arange(max_seq_len, dtype=torch.float32)
+        theta = torch.einsum("i,j -> ij", t, angular_freq)
+        self.cos = nn.Buffer(theta.cos(), persistent=False)
+        self.sin = nn.Buffer(theta.sin(), persistent=False)
+
+    def forward(self, x_BTHD: Tensor):
+        assert self.cos.size(0) >= x_BTHD.size(-3)
+        cos, sin = self.cos[None, :x_BTHD.size(-3), None, :], self.sin[None, :x_BTHD.size(-3), None, :]
+        x1, x2 = x_BTHD.to(dtype=torch.float32).chunk(2, dim=-1)
+        y1 = x1 * cos + x2 * sin
+        y2 = x1 * (-sin) + x2 * cos
+        return torch.cat((y1, y2), 3).type_as(x_BTHD)
+
 
 class CausalSelfAttention(nn.Module):
 
@@ -41,6 +63,7 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
+        self.rotary = Rotary(config.n_embd // config.n_head, config.block_size)
         self.mup_enabled = config.mup_enabled
         self.mup_disable_attention_scaling = config.mup_disable_attention_scaling
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
@@ -59,6 +82,8 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+
+        q, k = self.rotary(q), self.rotary(k)
 
         if self.mup_enabled and not self.mup_disable_attention_scaling:
             ### Begin muP code ###
@@ -208,8 +233,9 @@ class GPT(nn.Module):
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-        x = self.transformer.drop((tok_emb + pos_emb))
+        # pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
+        # x = self.transformer.drop((tok_emb + pos_emb))
+        x = self.transformer.drop(tok_emb)
         if self.config.mup_enabled:
             ### Begin muP code ###
             x *= self.config.mup_input_alpha
