@@ -267,11 +267,15 @@ def get_lr(it):
     # 2) if it > lr_decay_iters, return min learning rate
     if it > lr_decay_iters:
         return min_lr
-    # 3) in between, use cosine decay down to min learning rate
+    # # 3) in between, use cosine decay down to min learning rate
+    # decay_ratio = (it - warmup_iters) / (lr_decay_iters - warmup_iters)
+    # assert 0 <= decay_ratio <= 1
+    # coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff ranges 0..1
+    # return min_lr + coeff * (learning_rate - min_lr)
+    # 3) linear decay
     decay_ratio = (it - warmup_iters) / (lr_decay_iters - warmup_iters)
     assert 0 <= decay_ratio <= 1
-    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff ranges 0..1
-    return min_lr + coeff * (learning_rate - min_lr)
+    return learning_rate * (1.0 - decay_ratio)
 
 # logging
 if master_process:
@@ -331,7 +335,7 @@ while True:
                     'config': config,
                 }
                 print(f"saving checkpoint to {out_dir}")
-                torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+                torch.save(checkpoint, os.path.join(out_dir, f'ckpt_{iter_num}.pt'))
     if iter_num == 0 and eval_only:
         break
 
