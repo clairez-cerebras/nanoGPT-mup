@@ -28,11 +28,11 @@ class LayerNorm(nn.Module):
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
 
-class Rotary(nn.Module):
-    def __init__(self, dim: int, max_seq_len: int):
+class Rotary_Half_Truncate(nn.Module):
+    def __init__(self, dim: int, max_seq_len: int, rope_theta: float):
         super().__init__()
         # half-truncate RoPE by @YouJiacheng (w/ base freq tuning)
-        angular_freq = (1 / 1024) ** torch.linspace(0, 1, steps=dim//4, dtype=torch.float32)
+        angular_freq = (1 / rope_theta) ** torch.linspace(0, 1, steps=dim//4, dtype=torch.float32)
         angular_freq = torch.cat([angular_freq, angular_freq.new_zeros(dim//4)])
         t = torch.arange(max_seq_len, dtype=torch.float32)
         theta = torch.einsum("i,j -> ij", t, angular_freq)
@@ -46,6 +46,35 @@ class Rotary(nn.Module):
         y1 = x1 * cos + x2 * sin
         y2 = x1 * (-sin) + x2 * cos
         return torch.cat((y1, y2), 3).type_as(x_BTHD)
+
+
+class Rotary(nn.Module):
+    def __init__(self, dim: int, rope_theta: float):
+        super().__init__()
+        dim_indices = torch.arange(0, dim // 2, dtype=torch.float32)
+        inv_freq = 1.0 / (rope_theta ** (2 * dim_indices / dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+    
+    @staticmethod
+    def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+        out = torch.empty_like(x)
+        out[..., 0::2] = -x[..., 1::2]
+        out[..., 1::2] =  x[..., 0::2]
+        return out
+    
+    def forward(self, x_BTHD: torch.Tensor) -> torch.Tensor:
+        B, T, H, D = x_BTHD.shape
+        t = torch.arange(T, device=x_BTHD.device, dtype=self.inv_freq.dtype)
+        freqs = torch.einsum("i,j->ij", t, self.inv_freq)
+
+        sin = torch.sin(freqs)[None, :, None, :].to(dtype=x_BTHD.dtype)
+        cos = torch.cos(freqs)[None, :, None, :].to(dtype=x_BTHD.dtype)
+
+        sin = torch.repeat_interleave(sin, 2, dim=-1)
+        cos = torch.repeat_interleave(cos, 2, dim=-1)
+
+        return x_BTHD * cos + self._rotate_half(x_BTHD) * sin
+    
 
 
 class CausalSelfAttention(nn.Module):
@@ -63,7 +92,13 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
-        self.rotary = Rotary(config.n_embd // config.n_head, config.block_size)
+        self.rotary_type = config.rope_type
+        if self.rotary_type == "rotary_half_truncate":
+            self.rotary = Rotary_Half_Truncate(config.n_embd // config.n_head, config.block_size, config.rope_theta)
+        elif self.rotary_type == "rotary":
+            self.rotary = Rotary(config.n_embd // config.n_head, config.rope_theta)
+        else:
+            raise NotImplementedError(f"Unknown rotary type: {self.rotary_type}")
         self.mup_enabled = config.mup_enabled
         self.mup_disable_attention_scaling = config.mup_disable_attention_scaling
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
@@ -152,6 +187,8 @@ class GPTConfig:
     n_head: int = 12
     n_embd: int = 768
     dropout: float = 0.0
+    rope_type: str = "rotary"
+    rope_theta: str = 10000.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     init_std: float = 0.02
     mup_enabled: bool = False # Whether to use muP. If False then all other mup variables are ignored
