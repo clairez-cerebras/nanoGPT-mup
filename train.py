@@ -47,7 +47,7 @@ wandb_log = False # disabled by default
 wandb_project = 'owt'
 wandb_run_name = 'gpt2' # 'run' + str(time.time())
 # csv logging
-csv_log = False # If enabled, logs stats to a csv file
+csv_log = True # If enabled, logs stats to a csv file
 # data
 dataset = 'openwebtext'
 gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
@@ -60,6 +60,7 @@ n_embd = 768
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
 init_std = 0.02 # Initialization standard deviation for weights
+rope_theta = 10000.0
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
 max_iters = 600000 # total number of training iterations
@@ -98,6 +99,10 @@ config_keys = [k for k,v in globals().items() if not k.startswith('_') and isins
 exec(open('configurator.py').read()) # overrides from command line or config file
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
+
+print("====== CONFIG ======")
+print(config)
+print("====== CONFIG ======")
 
 assert not (never_save_checkpoint and always_save_checkpoint)
 
@@ -412,6 +417,17 @@ while True:
 
     # termination conditions
     if iter_num > max_iters:
+        if master_process and not never_save_checkpoint:
+            print("reached max_iters, saving final checkpoint")
+            checkpoint = {
+                'model': raw_model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'model_args': model_args,
+                'iter_num': iter_num-1,
+                'best_val_loss': best_val_loss,
+                'config': config,
+            }
+            torch.save(checkpoint, os.path.join(out_dir, f'ckpt_{iter_num-1}.pt'))
         break
 
 if ddp:
